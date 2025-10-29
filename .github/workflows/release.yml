@@ -1,0 +1,284 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version-type:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      custom-version:
+        description: 'Custom version (overrides version-type if provided)'
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Run Tests
+    uses: ./.github/workflows/test.yml
+
+  version-bump:
+    name: Bump Version
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.new-version.outputs.version }}
+
+    steps:
+    - name: Install cargo-edit
+      run: cargo install cargo-edit
+
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+
+    - name: Calculate new version
+      id: new-version
+      run: |
+        CURRENT=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+        echo "Current version: $CURRENT"
+
+        if [ -n "${{ github.event.inputs.custom-version }}" ]; then
+          NEW_VERSION="${{ github.event.inputs.custom-version }}"
+          echo "Using custom version: $NEW_VERSION"
+        else
+          IFS='.' read -ra VERSION_PARTS <<< "$CURRENT"
+          MAJOR=${VERSION_PARTS[0]}
+          MINOR=${VERSION_PARTS[1]}
+          PATCH=${VERSION_PARTS[2]}
+
+          case "${{ github.event.inputs.version-type }}" in
+            "major")
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            "minor")
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            "patch")
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "Bumping ${{ github.event.inputs.version-type }} version: $CURRENT -> $NEW_VERSION"
+        fi
+
+        echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+    - name: Update Cargo.toml version
+      run: |
+        cargo set-version ${{ steps.new-version.outputs.version }}
+
+        NEW_VERSION_CHECK=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+        echo "Version updated to: $NEW_VERSION_CHECK"
+
+        cargo check
+
+    - name: Commit and push version changes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+
+        git add Cargo.toml Cargo.lock
+
+        if git diff --staged --quiet; then
+          echo "No changes to commit - version already bumped"
+        else
+          git commit -m "chore: bump version to v${{ steps.new-version.outputs.version }}"
+          git push origin main
+        fi
+
+  rust:
+    name: Build Release Assets
+    needs: [test, version-bump]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/rust.yml
+
+  docker:
+    name: Build and Push Docker Images
+    needs: [test, version-bump]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+
+  create-tag:
+    name: Create Release Tag
+    needs: [version-bump, rust, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        ref: main
+        fetch-depth: 0
+
+    - name: Create and push tag
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+
+        TAG="v${{ needs.version-bump.outputs.version }}"
+
+        if git rev-parse "$TAG" >/dev/null 2>&1; then
+          echo "Tag $TAG already exists locally, deleting it"
+          git tag -d "$TAG"
+        fi
+
+        if git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
+          echo "Tag $TAG already exists on remote, deleting it"
+          git push origin --delete "$TAG"
+        fi
+
+        git tag -a "$TAG" -m "Release $TAG"
+        git push origin "$TAG"
+
+  release:
+    name: Create Release
+    needs: [version-bump, create-tag]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        ref: v${{ needs.version-bump.outputs.version }}
+        fetch-depth: 0
+
+    - name: Download binary artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: natpmp-http-api-*
+        path: artifacts
+        merge-multiple: true
+
+    - name: Prepare release assets
+      run: |
+        mkdir -p release-assets
+        find artifacts -type f -exec cp {} release-assets/ \;
+        ls -la release-assets/
+
+    - name: Generate release notes
+      id: release-notes
+      run: |
+        VERSION="v${{ needs.version-bump.outputs.version }}"
+
+        LAST_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+
+        if [ -n "$LAST_TAG" ]; then
+          echo "Generating changelog since $LAST_TAG"
+          COMMITS=$(git log --pretty=format:"- %s (%h)" "$LAST_TAG"..HEAD)
+        else
+          echo "No previous tag found, generating changelog from all commits"
+          COMMITS=$(git log --pretty=format:"- %s (%h)" --max-count=20)
+        fi
+
+        # Create release notes
+        cat > release-notes.md << EOF
+        ## NAT-PMP HTTP Server $VERSION
+
+        ### What's Changed
+
+        $COMMITS
+
+        **Full Changelog**: https://github.com/${{ github.repository }}/compare/$LAST_TAG...$VERSION
+
+        ---
+
+        ### Binary Downloads
+
+        **Linux:**
+        - \`natpmp-http-api-linux-amd64\` - x86_64
+        - \`natpmp-http-api-linux-arm64\` - ARM64/aarch64
+        - \`natpmp-http-api-linux-armv7\` - ARMv7
+        - \`natpmp-http-api-linux-riscv64\` - RISC-V 64-bit
+
+        ### Usage
+
+        \`\`\`bash
+        wget https://github.com/${{ github.repository }}/releases/download/$VERSION/natpmp-http-api-linux-amd64
+        chmod +x natpmp-http-api-linux-amd64
+
+        API_TOKEN=your-secret-token ./natpmp-http-api-linux-amd64 --gateway=10.2.0.1
+        \`\`\`
+
+        ### Containers
+
+        Multi-architecture container images are also available:
+
+        \`\`\`bash
+        docker run --cap-add NET_ADMIN --cap-add NET_RAW \\
+          --network host \\
+          -e NATPMP_GATEWAY=10.2.0.1 \\
+          -e API_TOKEN=your-secret \\
+          ghcr.io/${{ github.repository_owner }}/natpmp-http-api:$VERSION
+        \`\`\`
+
+        ### Verification
+
+        All binaries include SHA256 checksums for verification:
+
+        \`\`\`bash
+        # Verify download integrity
+        sha256sum -c natpmp-http-api-linux-amd64.sha256
+        \`\`\`
+
+        🔒 All binaries are built from source using GitHub Actions for full transparency and security.
+        EOF
+
+        echo "Release notes generated"
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ needs.version-bump.outputs.version }}
+        name: NAT-PMP Server v${{ needs.version-bump.outputs.version }}
+        body_path: release-notes.md
+        draft: false
+        prerelease: false
+        files: release-assets/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Summary
+      run: |
+        VERSION="v${{ needs.version-bump.outputs.version }}"
+        echo "## 🎉 Release $VERSION Complete!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Version**: $VERSION" >> $GITHUB_STEP_SUMMARY
+        echo "**Bump Type**: ${{ github.event.inputs.version-type }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📦 Release Assets" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Binaries built and uploaded" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ SHA256 checksums generated" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Docker images built (linux/amd64, linux/arm64, linux/arm/v7, linux/riscv64)" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Release created with full documentation" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🐳 Docker Images" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "ghcr.io/${{ github.repository }}:${{ needs.version-bump.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+        echo "ghcr.io/${{ github.repository }}:latest" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Release URL**: https://github.com/${{ github.repository }}/releases/tag/$VERSION" >> $GITHUB_STEP_SUMMARY

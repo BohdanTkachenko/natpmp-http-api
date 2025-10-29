@@ -1,0 +1,117 @@
+name: Rust
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch, tag, or commit SHA)'
+        required: false
+        type: string
+
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch, tag, or commit SHA)'
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    if: ${{ always() && needs.test.result != 'failure' }}
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: natpmp-http-api-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: natpmp-http-api-linux-arm64
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            name: natpmp-http-api-linux-armv7
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-latest
+            name: natpmp-http-api-linux-riscv64
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        ref: ${{ inputs.ref || github.ref }}
+
+    - name: Install build dependencies
+      run: |
+        PACKAGES="musl-tools"
+        if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+          PACKAGES="$PACKAGES gcc-aarch64-linux-gnu"
+        elif [ "${{ matrix.target }}" = "armv7-unknown-linux-musleabihf" ]; then
+          PACKAGES="$PACKAGES gcc-arm-linux-gnueabihf"
+        elif [ "${{ matrix.target }}" = "riscv64gc-unknown-linux-gnu" ]; then
+          PACKAGES="$PACKAGES gcc-riscv64-linux-gnu"
+        fi
+
+        sudo apt-get update
+        sudo apt-get install -y $PACKAGES
+
+    - name: Install Rust target
+      run: rustup target add ${{ matrix.target }}
+
+    - name: Configure Cargo for cross-compilation
+      if: matrix.target == 'aarch64-unknown-linux-musl' || matrix.target == 'armv7-unknown-linux-musleabihf' || matrix.target == 'riscv64gc-unknown-linux-gnu'
+      run: |
+        if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+          TARGET="aarch64-unknown-linux-musl"
+          LINKER="aarch64-linux-gnu-gcc"
+        elif [ "${{ matrix.target }}" = "armv7-unknown-linux-musleabihf" ]; then
+          TARGET="armv7-unknown-linux-musleabihf"
+          LINKER="arm-linux-gnueabihf-gcc"
+        elif [ "${{ matrix.target }}" = "riscv64gc-unknown-linux-gnu" ]; then
+          TARGET="riscv64gc-unknown-linux-gnu"
+          LINKER="riscv64-linux-gnu-gcc"
+        fi
+
+        mkdir -p ~/.cargo
+        cat >> ~/.cargo/config.toml << EOF
+        [target.$TARGET]
+        linker = "$LINKER"
+        EOF
+
+    - name: Cache Cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build binary
+      run: |
+        cargo build --verbose --release --target ${{ matrix.target }}
+
+        if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+          STRIP="aarch64-linux-gnu-strip"
+        elif [ "${{ matrix.target }}" = "armv7-unknown-linux-musleabihf" ]; then
+          STRIP="arm-linux-gnueabihf-strip"
+        elif [ "${{ matrix.target }}" = "riscv64gc-unknown-linux-gnu" ]; then
+          STRIP="riscv64-linux-gnu-strip"
+        else
+          STRIP="strip"
+        fi
+
+        $STRIP target/${{ matrix.target }}/release/natpmp-http-api
+        cp target/${{ matrix.target }}/release/natpmp-http-api ${{ matrix.name }}
+        sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.name }}
+        path: |
+          ${{ matrix.name }}*

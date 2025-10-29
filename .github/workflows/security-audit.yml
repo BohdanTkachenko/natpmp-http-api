@@ -1,0 +1,171 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      issues: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+
+    - name: Run cargo audit
+      id: audit
+      continue-on-error: true
+      run: |
+        cargo audit --json > audit-results.json
+        cargo audit
+
+    - name: Parse audit results
+      id: parse-results
+      if: always()
+      run: |
+        if [ -f audit-results.json ]; then
+          VULN_COUNT=$(jq '.vulnerabilities.found | length' audit-results.json 2>/dev/null || echo "0")
+          echo "vulnerability_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$VULN_COUNT" -gt 0 ]; then
+            echo "Found $VULN_COUNT security vulnerabilities!"
+            echo "audit_failed=true" >> $GITHUB_OUTPUT
+          else
+            echo "No security vulnerabilities found."
+            echo "audit_failed=false" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "audit_failed=false" >> $GITHUB_OUTPUT
+          echo "vulnerability_count=0" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create issue for vulnerabilities
+      if: steps.parse-results.outputs.audit_failed == 'true' && github.event_name == 'schedule'
+      uses: actions/github-script@v8
+      with:
+        script: |
+          const fs = require('fs');
+          
+          try {
+            const auditResults = JSON.parse(fs.readFileSync('audit-results.json', 'utf8'));
+            const vulns = auditResults.vulnerabilities.list;
+            
+            let issueBody = `# 🔒 Security Vulnerabilities Detected\n\n`;
+            issueBody += `Found ${vulns.length} security vulnerabilities in dependencies:\n\n`;
+            
+            vulns.forEach((vuln, index) => {
+              issueBody += `## ${index + 1}. ${vuln.advisory.title}\n\n`;
+              issueBody += `- **Package**: ${vuln.advisory.package}\n`;
+              issueBody += `- **Severity**: ${vuln.advisory.severity}\n`;
+              issueBody += `- **CVSS Score**: ${vuln.advisory.cvss || 'Not specified'}\n`;
+              issueBody += `- **Description**: ${vuln.advisory.description}\n`;
+              issueBody += `- **URL**: ${vuln.advisory.url}\n`;
+              if (vuln.advisory.patched_versions && vuln.advisory.patched_versions.length > 0) {
+                issueBody += `- **Patched Versions**: ${vuln.advisory.patched_versions.join(', ')}\n`;
+              }
+              issueBody += `\n`;
+            });
+            
+            issueBody += `## 🛠️ Recommended Actions\n\n`;
+            issueBody += `1. Review the vulnerabilities above\n`;
+            issueBody += `2. Update affected dependencies: \`cargo update\`\n`;
+            issueBody += `3. If updates don't fix the issues, consider:\n`;
+            issueBody += `   - Finding alternative dependencies\n`;
+            issueBody += `   - Waiting for upstream patches\n`;
+            issueBody += `   - Assessing if the vulnerability affects our use case\n\n`;
+            issueBody += `This issue was automatically created by the security audit workflow.\n`;
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security,vulnerability',
+              state: 'open'
+            });
+
+            if (issues.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🔒 Security Vulnerabilities Found - ${new Date().toISOString().split('T')[0]}`,
+                body: issueBody,
+                labels: ['security', 'vulnerability', 'dependencies']
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues[0].number,
+                body: `## Updated Security Audit Results - ${new Date().toISOString()}\n\n${issueBody}`
+              });
+            }
+          } catch (error) {
+            console.error('Error processing audit results:', error);
+          }
+
+    - name: Upload audit results
+      if: always()
+      uses: actions/upload-artifact@v5
+      with:
+        name: security-audit-results
+        path: audit-results.json
+        retention-days: 30
+
+    - name: Fail on vulnerabilities
+      if: steps.parse-results.outputs.audit_failed == 'true'
+      run: |
+        echo "❌ Security audit failed with ${{ steps.parse-results.outputs.vulnerability_count }} vulnerabilities"
+        echo "Please review and address the security issues above."
+        exit 1
+
+  dependency-check:
+    name: Check for outdated dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-outdated
+      run: cargo install cargo-outdated
+
+    - name: Check outdated dependencies
+      run: cargo outdated --root-deps-only
+
+    - name: Show update summary
+      run: |
+        echo "## 📦 Dependency Status" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Outdated Dependencies" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        cargo outdated --root-deps-only >> $GITHUB_STEP_SUMMARY || echo "All dependencies up to date!" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "💡 **Tip**: Dependabot will automatically create PRs for dependency updates every Monday." >> $GITHUB_STEP_SUMMARY
