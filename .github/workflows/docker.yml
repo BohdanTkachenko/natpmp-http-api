@@ -7,11 +7,19 @@ on:
         description: 'Git ref to build (branch, tag, or commit SHA)'
         required: false
         type: string
+      version:
+        description: 'Version tag for Docker metadata (e.g., v1.2.3)'
+        required: false
+        type: string
 
   workflow_dispatch:
     inputs:
       ref:
         description: 'Git ref to build (branch, tag, or commit SHA).'
+        required: false
+        type: string
+      version:
+        description: 'Version tag for Docker metadata (e.g., v1.2.3)'
         required: false
         type: string
 
@@ -42,20 +50,34 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
+    - name: Determine version tag
+      id: version-tag
+      run: |
+        # Use version input if provided, otherwise fall back to ref if it's a version tag
+        if [ -n "${{ inputs.version }}" ]; then
+          VERSION="${{ inputs.version }}"
+        elif [ -n "${{ inputs.ref }}" ] && [[ "${{ inputs.ref }}" == v* ]]; then
+          VERSION="${{ inputs.ref }}"
+        else
+          VERSION=""
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Using version: $VERSION"
+
     - name: Extract metadata (for releases with semver tags)
-      if: inputs.ref && startsWith(inputs.ref, 'v')
+      if: steps.version-tag.outputs.version != ''
       id: meta-release
       uses: docker/metadata-action@v5
       with:
         images: ghcr.io/${{ github.repository }}
         tags: |
-          type=semver,pattern={{version}},value=${{ inputs.ref }}
-          type=semver,pattern={{major}}.{{minor}},value=${{ inputs.ref }}
-          type=semver,pattern={{major}},value=${{ inputs.ref }}
+          type=semver,pattern={{version}},value=${{ steps.version-tag.outputs.version }}
+          type=semver,pattern={{major}}.{{minor}},value=${{ steps.version-tag.outputs.version }}
+          type=semver,pattern={{major}},value=${{ steps.version-tag.outputs.version }}
           type=raw,value=latest
 
     - name: Extract metadata (for CI builds)
-      if: ${{ !inputs.ref || !startsWith(inputs.ref, 'v') }}
+      if: steps.version-tag.outputs.version == ''
       id: meta-ci
       uses: docker/metadata-action@v5
       with:
@@ -73,15 +95,15 @@ jobs:
         platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/riscv64
         push: true
         pull: true
-        tags: ${{ (inputs.ref && startsWith(inputs.ref, 'v')) && steps.meta-release.outputs.tags || steps.meta-ci.outputs.tags }}
-        labels: ${{ (inputs.ref && startsWith(inputs.ref, 'v')) && steps.meta-release.outputs.labels || steps.meta-ci.outputs.labels }}
+        tags: ${{ steps.version-tag.outputs.version != '' && steps.meta-release.outputs.tags || steps.meta-ci.outputs.tags }}
+        labels: ${{ steps.version-tag.outputs.version != '' && steps.meta-release.outputs.labels || steps.meta-ci.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
     - name: Get image size
       id: image-size
       run: |
-        if [ -n "${{ inputs.ref }}" ] && [[ "${{ inputs.ref }}" == v* ]]; then
+        if [ -n "${{ steps.version-tag.outputs.version }}" ]; then
           IMAGE_TAG=$(echo "${{ steps.meta-release.outputs.tags }}" | head -1)
         else
           IMAGE_TAG=$(echo "${{ steps.meta-ci.outputs.tags }}" | head -1)
@@ -107,12 +129,13 @@ jobs:
         echo "## 🐳 Docker Images Pushed" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**Ref**: ${{ inputs.ref || github.ref }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Version**: ${{ steps.version-tag.outputs.version || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
         echo "**Platforms**: linux/amd64, linux/arm64, linux/arm/v7, linux/riscv64" >> $GITHUB_STEP_SUMMARY
         echo "**Image Size**: ${{ steps.image-size.outputs.size_mb }} MB" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### 📦 Published Tags" >> $GITHUB_STEP_SUMMARY
         echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-        if [ -n "${{ inputs.ref }}" ] && [[ "${{ inputs.ref }}" == v* ]]; then
+        if [ -n "${{ steps.version-tag.outputs.version }}" ]; then
           echo "${{ steps.meta-release.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
         else
           echo "${{ steps.meta-ci.outputs.tags }}" >> $GITHUB_STEP_SUMMARY

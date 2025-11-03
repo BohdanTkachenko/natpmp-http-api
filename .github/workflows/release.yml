@@ -118,7 +118,7 @@ jobs:
       packages: write
     uses: ./.github/workflows/docker.yml
     with:
-      ref: v${{ needs.version-bump.outputs.version }}
+      version: v${{ needs.version-bump.outputs.version }}
 
   create-tag:
     name: Create Release Tag
